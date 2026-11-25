@@ -1,223 +1,191 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Multi-Agent Report Writer</title>
-<style>
-  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1f24; --muted:#6b7280; --line:#dfe3e8; --accent:#2f5bea; --ok:#1a7f4b; --err:#c0362c; }
-  * { box-sizing: border-box; }
-  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); line-height:1.5; }
-  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
-  h1 { font-size: 1.5rem; margin: 0 0 4px; }
-  .sub { color: var(--muted); margin: 0 0 20px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
-  label { display:block; font-size:.85rem; color:var(--muted); margin-bottom:4px; }
-  input, select { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font: inherit; background:#fff; color:var(--text); }
-  .row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
-  .api { margin-top: 12px; }
-  button { margin-top: 14px; padding: 10px 18px; border: 0; border-radius: 8px; background: var(--accent); color:#fff; font: inherit; font-weight: 600; cursor: pointer; }
-  button:disabled { opacity: .55; cursor: not-allowed; }
-  button.secondary { background: #fff; color: var(--text); border: 1px solid var(--line); margin-left: 8px; }
-  ul#steps { list-style: none; margin: 0; padding: 0; }
-  ul#steps li { padding: 8px 0; border-bottom: 1px solid var(--line); display:flex; gap:10px; align-items:baseline; }
-  ul#steps li:last-child { border-bottom: 0; }
-  .dot { width:10px; height:10px; border-radius:50%; background: var(--ok); flex: none; }
-  .time { color: var(--muted); font-size: .8rem; margin-left:auto; flex:none; }
-  .detail { color: var(--muted); font-size: .85rem; }
-  #status { font-size: .9rem; color: var(--muted); margin-top: 10px; min-height: 1.2em; }
-  #status.error { color: var(--err); }
-  #report { white-space: pre-wrap; word-wrap: break-word; font-family: Georgia, "Times New Roman", serif; font-size: 1rem; }
-  .meta { font-size: .85rem; color: var(--muted); margin-bottom: 8px; }
-  .hidden { display: none; }
-  @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Multi-Agent Report Writer</title>
+  <meta name="description" content="Generate a researched, reviewed report with four cooperating AI agents.">
+  <link rel="stylesheet" href="style.css">
+
+  <!-- Page-specific styles (the general theme is in style.css) -->
+  <style>
+    [hidden] { display: none !important; }
+
+    .page-intro { text-align: center; padding-block: 2.5rem 1rem; }
+    .page-intro p { max-width: 60ch; margin-inline: auto; }
+
+    .stack > * + * { margin-top: var(--gap); }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+    .actions { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: center; }
+    .hint { font-size: 0.9rem; color: var(--muted); margin-top: 0.35rem; }
+
+    /* status line */
+    .status-row { display: flex; flex-wrap: wrap; gap: 0.5rem 1.5rem; align-items: center; margin-bottom: 0.9rem; }
+    #statusText { font-weight: 700; }
+    .meta { font-family: var(--font-head); font-size: 0.9rem; }
+
+    /* progress bar */
+    .progress { height: 18px; border: 2px solid var(--border); background: var(--pale); margin-bottom: 1.1rem; }
+    #progressBar { height: 100%; width: 0; background: var(--pink); border-right: 2px solid var(--border); transition: width 0.4s ease; }
+
+    /* agent steps */
+    #steps { list-style: none; padding: 0; display: grid; gap: 0.6rem; }
+    .step {
+      display: grid; grid-template-columns: 11rem 1fr auto; gap: 0.75rem; align-items: center;
+      padding: 0.6rem 0.9rem; border: 2px solid var(--border); background: var(--pale);
+    }
+    .step-name  { font-family: var(--font-head); font-weight: 700; }
+    .step-role  { font-size: 0.92rem; color: var(--muted); }
+    .step-state { font-family: var(--font-head); font-size: 0.82rem; font-weight: 700; padding: 0.1rem 0.6rem; border: 1px solid var(--border); background: var(--white); color: var(--ink); }
+    .step-running { background: #ffd3e8; animation: pulse 1.2s ease-in-out infinite; }
+    .step-running .step-state { background: var(--pink); }
+    .step-done  { background: #d5f2ec; }
+    .step-done .step-state { background: var(--mint); }
+    .step-error { background: #ffd9d9; }
+    .step-error .step-state { background: #ff8a8a; }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 4px rgba(255, 119, 183, 0.35); } }
+    @media (prefers-reduced-motion: reduce) { .step-running { animation: none; } }
+
+    /* log and review */
+    #log {
+      list-style: none; padding: 0; margin: 0; max-height: 240px; overflow-y: auto;
+      font-family: var(--font-head); font-size: 0.82rem; line-height: 1.5;
+    }
+    #log li { padding: 0.15rem 0; border-bottom: 1px dashed rgba(118, 81, 134, 0.35); }
+    .log-error   { color: #b00020; font-weight: 700; }
+    .log-warn    { color: #8a5a00; }
+    .log-success { color: #1b7f5c; font-weight: 700; }
+    #review { white-space: pre-wrap; max-height: 240px; overflow-y: auto; font-size: 0.95rem; margin: 0; }
+    #review:empty::before, #log:empty::before { content: "Nothing yet."; color: var(--muted); font-family: var(--font-body); }
+
+    /* error box */
+    #errorBox { border: 2px solid #b00020; background: #ffe3e3; color: #7a0016; padding: 0.8rem 1rem; font-weight: 700; }
+
+    /* final report */
+    .report-toolbar { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; justify-content: space-between; margin-bottom: 1rem; }
+    #wordCount { font-family: var(--font-head); font-size: 0.9rem; }
+    #report { overflow-wrap: anywhere; }
+    #report:empty::before { content: "Your report will appear here."; color: var(--muted); }
+    #report h1 { font-size: 1.8rem; }
+    #report h2 { font-size: 1.4rem; margin-top: 1.4em; }
+    #report h3 { font-size: 1.15rem; }
+    #report ul, #report ol { padding-left: 1.4rem; margin-bottom: 1em; }
+    #report pre { margin-bottom: 1em; }
+
+    @media (max-width: 640px) {
+      .form-row { grid-template-columns: 1fr; }
+      .step { grid-template-columns: 1fr auto; }
+      .step-role { grid-column: 1 / -1; order: 3; }
+    }
+  </style>
 </head>
 <body>
-<main>
-  <h1>Multi-Agent Report Writer</h1>
-  <p class="sub">Planner, Researcher, Literature, Writer, Reviewer, Citation and Editor agents working on your topic.</p>
 
-  <section class="card">
-    <label for="topic">Report topic</label>
-    <input id="topic" type="text" placeholder="e.g. Advancements in Quantum Computing" maxlength="300">
-
-    <div class="row">
-      <div>
-        <label for="tone">Tone</label>
-        <select id="tone">
-          <option value="professional">Professional</option>
-          <option value="academic">Academic</option>
-          <option value="simple">Simple</option>
-        </select>
-      </div>
-      <div>
-        <label for="length">Length</label>
-        <select id="length">
-          <option value="short">Short</option>
-          <option value="detailed" selected>Detailed</option>
-          <option value="comprehensive">Comprehensive</option>
-        </select>
-      </div>
+  <header class="site-header">
+    <div class="container">
+      <a class="logo" href="/">&gt;_ report_writer</a>
+      <small style="color: var(--pale);">Researcher &rarr; Writer &rarr; Reviewer &rarr; Final Editor</small>
     </div>
+  </header>
 
-    <div class="api">
-      <label for="api">API address</label>
-      <input id="api" type="text" value="http://localhost:8000">
+  <main class="container stack">
+
+    <section class="page-intro">
+      <h1>Multi-Agent Report Writer</h1>
+      <p>Enter a topic. Four AI agents research it, write a draft, review it, and combine everything into one final report.</p>
+    </section>
+
+    <!-- 1. New report form -->
+    <section class="card" aria-labelledby="form-title">
+      <div class="card-bar" id="form-title">new_report.exe</div>
+      <div class="card-body">
+        <form id="topicForm" novalidate>
+          <div class="form-group">
+            <label for="topic">Report topic</label>
+            <input type="text" id="topic" name="topic" maxlength="300" required
+                   placeholder="e.g. Advancements in quantum computing" autocomplete="off">
+            <p class="hint">3 to 300 characters. Be specific for better results.</p>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="reportLength">Length</label>
+              <select id="reportLength" name="report_length">
+                <option value="short">Short (about 300 words)</option>
+                <option value="detailed" selected>Detailed (about 450 words)</option>
+                <option value="comprehensive">Comprehensive (about 700 words)</option>
+              </select>
+            </div>
+            <div class="form-group">
+              <label for="tone">Tone</label>
+              <select id="tone" name="tone">
+                <option value="professional" selected>Professional</option>
+                <option value="academic">Academic</option>
+                <option value="simple">Simple and clear</option>
+                <option value="persuasive">Persuasive</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="actions">
+            <button type="submit" id="startBtn" class="btn">Generate report</button>
+            <button type="button" id="stopBtn" class="btn btn-outline" hidden>Stop</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <div id="errorBox" role="alert" hidden></div>
+
+    <!-- 2. Live progress -->
+    <section class="card" aria-labelledby="progress-title">
+      <div class="card-bar" id="progress-title">agents.exe</div>
+      <div class="card-body">
+        <div class="status-row" aria-live="polite">
+          <span id="statusText">Ready</span>
+          <span class="meta">Time: <span id="timer">00:00</span></span>
+          <span class="meta" id="round"></span>
+        </div>
+        <div class="progress" role="progressbar" aria-label="Workflow progress"><div id="progressBar"></div></div>
+        <ol id="steps" aria-label="Agent steps"></ol>
+      </div>
+    </section>
+
+    <!-- 3. Activity log and reviewer feedback -->
+    <section class="grid grid-2">
+      <div class="card">
+        <div class="card-bar">activity_log.txt</div>
+        <div class="card-body"><ul id="log" aria-live="polite"></ul></div>
+      </div>
+      <div class="card">
+        <div class="card-bar">reviewer_feedback.txt</div>
+        <div class="card-body"><pre id="review" style="background:none;color:inherit;border:0;padding:0;"></pre></div>
+      </div>
+    </section>
+
+    <!-- 4. Final report -->
+    <section class="card" aria-labelledby="report-title">
+      <div class="card-bar" id="report-title">final_report.md</div>
+      <div class="card-body">
+        <div class="report-toolbar">
+          <span id="wordCount"></span>
+          <div class="actions">
+            <button type="button" id="copyBtn" class="btn btn-secondary" hidden>Copy</button>
+            <button type="button" id="downloadBtn" class="btn btn-outline" hidden>Download .md</button>
+          </div>
+        </div>
+        <article id="report"></article>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <div class="container text-center">
+      <small style="color: var(--pale);">Multi-Agent Report Writer &middot; Noida International University</small>
     </div>
+  </footer>
 
-    <button id="start">Generate report</button>
-    <button id="stop" class="secondary hidden">Stop</button>
-    <div id="status"></div>
-  </section>
-
-  <section class="card hidden" id="progressCard">
-    <strong>Agent progress</strong>
-    <ul id="steps"></ul>
-  </section>
-
-  <section class="card hidden" id="reportCard">
-    <div class="meta" id="meta"></div>
-    <div id="report"></div>
-    <button id="copy" class="secondary" style="margin-left:0">Copy report</button>
-    <button id="download" class="secondary">Download .md</button>
-  </section>
-</main>
-
-<script>
-  const $ = (id) => document.getElementById(id);
-  const startBtn = $("start"), stopBtn = $("stop"), statusEl = $("status");
-  let source = null, startedAt = 0, finished = false;
-
-  // Friendly names for the workflow nodes (unknown nodes fall back to their own name)
-  const LABELS = {
-    planner_node: "Planner: outline and research plan",
-    research_node: "Researcher and Literature: gathering sources",
-    researcher_node: "Researcher: gathering information",
-    literature_node: "Literature: finding papers",
-    writer_node: "Writer: drafting / revising",
-    reviewer_node: "Reviewer: scoring the draft",
-    citation_node: "Citation: checking references",
-    editor_node: "Editor: final polish",
-    final_aggregator_node: "Final aggregator: final report"
-  };
-
-  function setStatus(text, isError) {
-    statusEl.textContent = text;
-    statusEl.className = isError ? "error" : "";
-  }
-
-  function secs() { return ((Date.now() - startedAt) / 1000).toFixed(1) + "s"; }
-
-  function summarise(update) {
-    if (!update || typeof update !== "object") return "";
-    const parts = [];
-    if (update.feedback && update.feedback.overall_score !== undefined) {
-      parts.push("score " + update.feedback.overall_score + (update.feedback.pass ? " (pass)" : " (needs revision)"));
-    }
-    if (update.revision_round !== undefined) parts.push("round " + update.revision_round);
-    if (update.citations && Array.isArray(update.citations.issues)) parts.push(update.citations.issues.length + " citation issue(s)");
-    return parts.join(" · ");
-  }
-
-  function addStep(node, update) {
-    const li = document.createElement("li");
-    const dot = document.createElement("span"); dot.className = "dot";
-    const body = document.createElement("div");
-    const title = document.createElement("div");
-    title.textContent = LABELS[node] || node;
-    body.appendChild(title);
-    const info = summarise(update);
-    if (info) {
-      const d = document.createElement("div"); d.className = "detail"; d.textContent = info;
-      body.appendChild(d);
-    }
-    const t = document.createElement("span"); t.className = "time"; t.textContent = secs();
-    li.append(dot, body, t);
-    $("steps").appendChild(li);
-  }
-
-  function showReport(state) {
-    const text = state.final_report || state.draft || "(no report text was returned)";
-    $("report").textContent = typeof text === "string" ? text : JSON.stringify(text, null, 2);
-    const fb = state.feedback || {};
-    const bits = ["Topic: " + state.topic];
-    if (fb.overall_score !== undefined) bits.push("Final review score: " + fb.overall_score);
-    if (state.revision_round !== undefined) bits.push("Writer rounds: " + state.revision_round);
-    bits.push("Time: " + secs());
-    $("meta").textContent = bits.join("  ·  ");
-    $("reportCard").classList.remove("hidden");
-  }
-
-  function finish() {
-    if (source) { source.close(); source = null; }
-    startBtn.disabled = false;
-    stopBtn.classList.add("hidden");
-  }
-
-  startBtn.addEventListener("click", () => {
-    const topic = $("topic").value.trim();
-    if (topic.length < 3) { setStatus("Please enter a topic (at least 3 characters).", true); return; }
-
-    const base = $("api").value.trim().replace(/\/+$/, "");
-    const params = new URLSearchParams({ topic, tone: $("tone").value, report_length: $("length").value });
-
-    $("steps").innerHTML = "";
-    $("report").textContent = "";
-    $("reportCard").classList.add("hidden");
-    $("progressCard").classList.remove("hidden");
-    startBtn.disabled = true;
-    stopBtn.classList.remove("hidden");
-    finished = false;
-    startedAt = Date.now();
-    setStatus("Connecting...");
-
-    source = new EventSource(base + "/api/reports/stream?" + params.toString());
-
-    source.addEventListener("start", () => setStatus("Agents are working. This can take a few minutes..."));
-
-    source.addEventListener("progress", (e) => {
-      const d = JSON.parse(e.data);
-      addStep(d.node, d.update);
-    });
-
-    source.addEventListener("done", (e) => {
-      finished = true;
-      const d = JSON.parse(e.data);
-      showReport(d.state || {});
-      setStatus("Finished in " + secs() + ".");
-      finish();
-    });
-
-    // Event sent by the server when the workflow fails
-    source.addEventListener("error", (e) => {
-      if (e.data) {
-        finished = true;
-        setStatus("Error: " + (JSON.parse(e.data).message || "unknown error"), true);
-        finish();
-      } else if (!finished) {
-        // Connection-level error (server down, wrong address, CORS)
-        setStatus("Could not reach the API at " + base + ". Is the server running?", true);
-        finish();
-      }
-    });
-  });
-
-  stopBtn.addEventListener("click", () => { finished = true; finish(); setStatus("Stopped. The server may still finish the run."); });
-
-  $("copy").addEventListener("click", async () => {
-    try { await navigator.clipboard.writeText($("report").textContent); setStatus("Report copied."); }
-    catch (_) { setStatus("Copy failed. Select the text and copy it manually.", true); }
-  });
-
-  $("download").addEventListener("click", () => {
-    const blob = new Blob([$("report").textContent], { type: "text/markdown" });
-    const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "report.md";
-    a.click();
-    URL.revokeObjectURL(a.href);
-  });
-</script>
+  <script src="script.js"></script>
 </body>
 </html>
