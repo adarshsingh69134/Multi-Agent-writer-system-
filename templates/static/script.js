@@ -1,122 +1,177 @@
-/* ============================================================
-   script.js - frontend for the Multi-Agent Report Writer
-   Four agents: Researcher -> Writer -> Reviewer -> Final Editor
-
-   Talks to app.py:
-     GET /api/agents                      the agents in order
-     GET /api/reports/stream?topic=...    Server-Sent Events:
-         start | progress | done | error
-
-   Element IDs used in frontend.html (all optional except the form,
-   the topic input and the steps list):
-     topicForm   <form>              topic        <input>
-     reportLength <select>           tone         <select>
-     startBtn    <button>            stopBtn      <button>
-     steps       <ol>/<ul>           progressBar  <div> (width set in %)
-     statusText  text                timer        text
-     round       text                log          <ul>
-     review      <pre>/<div>         report       <div>
-     wordCount   text                copyBtn      <button>
-     downloadBtn <button>            errorBox     <div>
-   ============================================================ */
+/* script.js - Multi-Agent Report Writer frontend
+ *
+ * Works with the backend stream:
+ *   GET /api/reports/stream?topic=...&tone=...&length=...
+ * Events: start | progress | done | error
+ *
+ * It finds your page elements by common IDs first, then by position
+ * (first text input, first two <select>s, the Generate button, the box under
+ * "Live Agent Activity"), so it should work with the page in your screenshot.
+ */
 (function () {
   'use strict';
 
-  const API_BASE = ''; // same origin as app.py. Example: 'http://127.0.0.1:8000'
+  var API_BASE = ''; // same origin as app.py
 
-  // Fallback if /api/agents cannot be reached
-  const DEFAULT_AGENTS = [
-    { node: 'researcher_node', agent: 'Researcher',   step: 1, role: 'Plans key questions and gathers sources' },
-    { node: 'writer_node',     agent: 'Writer',       step: 2, role: 'Writes and revises the report' },
-    { node: 'reviewer_node',   agent: 'Reviewer',     step: 3, role: 'Scores the draft and returns feedback' },
-    { node: 'final_node',      agent: 'Final Editor', step: 4, role: 'Combines all information into the final report' },
-  ];
+  // ---------- find elements ----------
+  function byId(ids) {
+    for (var i = 0; i < ids.length; i++) {
+      var el = document.getElementById(ids[i]);
+      if (el) return el;
+    }
+    return null;
+  }
 
-  const $ = (id) => document.getElementById(id);
-  const els = {
-    form: $('topicForm'), topic: $('topic'), length: $('reportLength'), tone: $('tone'),
-    start: $('startBtn'), stop: $('stopBtn'),
-    steps: $('steps'), bar: $('progressBar'), status: $('statusText'), timer: $('timer'),
-    round: $('round'), log: $('log'), review: $('review'), report: $('report'),
-    words: $('wordCount'), copy: $('copyBtn'), download: $('downloadBtn'), error: $('errorBox'),
+  function findLogBox() {
+    var el = byId(['log', 'activityLog', 'liveActivity', 'agentActivity', 'activity', 'output', 'logs']);
+    if (el) return el;
+    var heads = document.querySelectorAll('h1,h2,h3,h4,label,strong');
+    for (var i = 0; i < heads.length; i++) {
+      if (/live agent activity/i.test(heads[i].textContent)) {
+        var next = heads[i].nextElementSibling;
+        if (next) return next;
+      }
+    }
+    return null;
+  }
+
+  function findButton() {
+    var el = byId(['generateBtn', 'startBtn', 'generate', 'generateReport', 'submitBtn']);
+    if (el) return el;
+    var btns = document.querySelectorAll('button, input[type=submit]');
+    for (var i = 0; i < btns.length; i++) {
+      if (/generate/i.test(btns[i].textContent || btns[i].value || '')) return btns[i];
+    }
+    return btns[0] || null;
+  }
+
+  var selects = document.querySelectorAll('select');
+  var els = {
+    topic: byId(['topic', 'reportTopic', 'topicInput']) || document.querySelector('input[type=text], input:not([type])'),
+    tone: byId(['tone', 'toneSelect']) || selects[0] || null,
+    length: byId(['length', 'reportLength', 'lengthSelect']) || selects[1] || null,
+    button: findButton(),
+    log: findLogBox(),
+    bar: byId(['progressBar', 'progress', 'bar']) || document.querySelector('progress, .progress-bar, .progress'),
+    report: byId(['report', 'reportOutput', 'reportContent', 'result', 'finalReport'])
   };
 
-  let agents = DEFAULT_AGENTS.slice();
-  let source = null;        // EventSource
-  let finished = false;     // true after done / error / stop
-  let timerId = null;
-  let startedAt = 0;
-  let lastReport = '';
-  let lastTopic = '';
+  // create a report area if the page has none
+  if (!els.report) {
+    els.report = document.createElement('div');
+    els.report.id = 'report';
+    els.report.style.cssText = 'margin-top:20px;line-height:1.6;';
+    var anchor = els.log && els.log.parentNode ? els.log : document.body;
+    if (anchor.parentNode && anchor !== document.body) {
+      anchor.parentNode.insertBefore(els.report, anchor.nextSibling);
+    } else {
+      document.body.appendChild(els.report);
+    }
+  }
 
-  // ---------- small helpers ----------
+  // ---------- state ----------
+  var source = null;
+  var finished = false;
+  var maxPercent = 0;
+
+  // ---------- helpers ----------
   function escapeHtml(s) {
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  function show(el, visible) { if (el) el.hidden = !visible; }
-  function setText(el, text) { if (el) el.textContent = text; }
-
-  function formatTime(ms) {
-    const s = Math.floor(ms / 1000);
-    return String(Math.floor(s / 60)).padStart(2, '0') + ':' + String(s % 60).padStart(2, '0');
-  }
-
-  function showError(message) {
-    if (els.error) { els.error.textContent = message; show(els.error, true); }
-    addLog('Error: ' + message, 'error');
-    setText(els.status, 'Something went wrong');
-  }
-
-  function addLog(message, kind) {
-    if (!els.log) return;
-    const li = document.createElement('li');
-    li.className = 'log-' + (kind || 'info');
-    const time = new Date().toLocaleTimeString();
-    li.textContent = '[' + time + '] ' + message;
-    els.log.appendChild(li);
+  function log(message, kind) {
+    if (!els.log) { console.log(message); return; }
+    var line = document.createElement('div');
+    line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + message;
+    if (kind === 'error') line.style.color = '#c0362c';
+    if (kind === 'success') line.style.color = '#1a7f4b';
+    if (kind === 'warn') line.style.color = '#b7791f';
+    els.log.appendChild(line);
     els.log.scrollTop = els.log.scrollHeight;
   }
 
-  // ---------- safe, minimal Markdown renderer (escapes HTML first) ----------
+  function setBar(percent) {
+    percent = Math.max(0, Math.min(100, Math.round(percent)));
+    if (percent < maxPercent && percent !== 0) percent = maxPercent; // revisions must not move it back
+    maxPercent = percent;
+    var bar = els.bar;
+    if (!bar) return;
+    if (bar.tagName === 'PROGRESS') { bar.max = 100; bar.value = percent; return; }
+    var target = bar.firstElementChild || bar;
+    target.style.width = percent + '%';
+    if (!bar.firstElementChild && !target.style.height) target.style.minHeight = '6px';
+  }
+
+  function setRunning(running) {
+    if (els.button) els.button.disabled = running;
+    if (els.topic) els.topic.disabled = running;
+    if (els.tone) els.tone.disabled = running;
+    if (els.length) els.length.disabled = running;
+  }
+
+  function closeSource() {
+    if (source) { source.close(); source = null; }
+  }
+
+  // ---------- map dropdown values to what the backend understands ----------
+  function lengthValue() {
+    var raw = String((els.length && els.length.value) || 'detailed').toLowerCase();
+    if (raw.indexOf('summ') !== -1 || raw.indexOf('short') !== -1) return 'short';
+    if (raw.indexOf('compre') !== -1 || raw.indexOf('long') !== -1) return 'comprehensive';
+    if (raw.indexOf('detail') !== -1) return 'detailed';
+    return raw;
+  }
+
+  function toneValue() {
+    return String((els.tone && els.tone.value) || 'professional').toLowerCase();
+  }
+
+  // ---------- small, safe Markdown renderer ----------
   function inline(text) {
-    let s = escapeHtml(text);
+    var s = escapeHtml(text);
     s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
     s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
     s = s.replace(/(^|[^*])\*([^*\s][^*]*)\*/g, '$1<em>$2</em>');
     s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"']+)\)/g,
       '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+    s = s.replace(/\u3010(https?:\/\/[^\s\u3011]+)\u3011/g,
+      '<a href="$1" target="_blank" rel="noopener noreferrer">[source]</a>');
     s = s.replace(/(^|[\s(>])(https?:\/\/[^\s<)]+)/g,
       '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>');
     return s;
   }
 
   function renderMarkdown(md) {
-    const lines = String(md || '').replace(/\r\n/g, '\n').split('\n');
-    const out = [];
-    let para = [];
-    let list = null; // 'ul' | 'ol'
-    let inCode = false;
-    let code = [];
+    var lines = String(md || '').replace(/\r\n/g, '\n').split('\n');
+    var out = [], para = [], list = null, table = [];
 
-    const flushPara = () => { if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); para = []; } };
-    const flushList = () => { if (list) { out.push('</' + list + '>'); list = null; } };
+    function flushPara() { if (para.length) { out.push('<p>' + inline(para.join(' ')) + '</p>'); para = []; } }
+    function flushList() { if (list) { out.push('</' + list + '>'); list = null; } }
+    function flushTable() {
+      if (!table.length) return;
+      var rows = table.filter(function (r) { return !/^\s*\|?\s*:?-{2,}/.test(r); });
+      var html = '<table style="border-collapse:collapse;margin:10px 0;">';
+      rows.forEach(function (r, i) {
+        var cells = r.trim().replace(/^\|/, '').replace(/\|$/, '').split('|');
+        var tag = i === 0 ? 'th' : 'td';
+        html += '<tr>' + cells.map(function (c) {
+          return '<' + tag + ' style="border:1px solid #ccc;padding:6px 10px;text-align:left;">' + inline(c.trim()) + '</' + tag + '>';
+        }).join('') + '</tr>';
+      });
+      out.push(html + '</table>');
+      table = [];
+    }
 
-    for (const line of lines) {
-      if (line.trim().startsWith('```')) {
-        if (inCode) { out.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>'); code = []; inCode = false; }
-        else { flushPara(); flushList(); inCode = true; }
-        continue;
-      }
-      if (inCode) { code.push(line); continue; }
+    lines.forEach(function (line) {
+      var m;
+      if (/^\s*\|.*\|\s*$/.test(line)) { flushPara(); flushList(); table.push(line); return; }
+      flushTable();
 
-      let m;
       if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
         flushPara(); flushList();
-        const level = m[1].length;
-        out.push('<h' + level + '>' + inline(m[2]) + '</h' + level + '>');
-      } else if ((m = line.match(/^\s*[-*]\s+(.*)$/))) {
+        out.push('<h' + m[1].length + '>' + inline(m[2]) + '</h' + m[1].length + '>');
+      } else if ((m = line.match(/^\s*[-*\u2022]\s+(.*)$/))) {
         flushPara();
         if (list !== 'ul') { flushList(); out.push('<ul>'); list = 'ul'; }
         out.push('<li>' + inline(m[1]) + '</li>');
@@ -130,137 +185,36 @@
         flushList();
         para.push(line.trim());
       }
-    }
-    if (inCode) out.push('<pre><code>' + escapeHtml(code.join('\n')) + '</code></pre>');
-    flushPara(); flushList();
-    return out.join('\n');
-  }
-
-  // ---------- step list ----------
-  const STATE_LABEL = { waiting: 'Waiting', running: 'Working...', done: 'Done', error: 'Failed' };
-
-  function renderSteps() {
-    if (!els.steps) return;
-    els.steps.innerHTML = '';
-    agents.forEach((a) => {
-      const li = document.createElement('li');
-      li.id = 'step-' + a.node;
-      li.className = 'step step-waiting';
-      li.innerHTML =
-        '<span class="step-name">' + escapeHtml(a.step + '. ' + a.agent) + '</span>' +
-        '<span class="step-role">' + escapeHtml(a.role || '') + '</span>' +
-        '<span class="step-state">' + STATE_LABEL.waiting + '</span>';
-      els.steps.appendChild(li);
     });
-    updateBar();
-  }
-
-  function setStep(node, state) {
-    const li = $('step-' + node);
-    if (!li) return;
-    li.className = 'step step-' + state;
-    const label = li.querySelector('.step-state');
-    if (label) label.textContent = STATE_LABEL[state] || state;
-    updateBar();
-  }
-
-  function updateBar() {
-    if (!els.bar || !els.steps) return;
-    const total = agents.length;
-    const done = els.steps.querySelectorAll('.step-done').length;
-    const running = els.steps.querySelectorAll('.step-running').length;
-    els.bar.style.width = Math.round(((done + running * 0.5) / total) * 100) + '%';
-  }
-
-  function nextNodeAfter(node, update) {
-    const i = agents.findIndex((a) => a.node === node);
-    if (node === 'reviewer_node') {
-      const verdict = String((update && update.feedback && update.feedback.overall_score) || '').toLowerCase();
-      return verdict.includes('verdict: pass') ? 'final_node' : 'writer_node'; // revise or finish
-    }
-    return i >= 0 && i < agents.length - 1 ? agents[i + 1].node : null;
-  }
-
-  // ---------- run state ----------
-  function setRunning(running) {
-    if (els.start) els.start.disabled = running;
-    if (els.topic) els.topic.disabled = running;
-    if (els.length) els.length.disabled = running;
-    if (els.tone) els.tone.disabled = running;
-    show(els.stop, running);
-    if (running) {
-      startedAt = Date.now();
-      clearInterval(timerId);
-      timerId = setInterval(() => setText(els.timer, formatTime(Date.now() - startedAt)), 1000);
-    } else {
-      clearInterval(timerId);
-      if (startedAt) setText(els.timer, formatTime(Date.now() - startedAt));
-    }
-  }
-
-  function closeSource() {
-    if (source) { source.close(); source = null; }
-  }
-
-  function resetUI() {
-    finished = false;
-    lastReport = '';
-    renderSteps();
-    if (els.log) els.log.innerHTML = '';
-    if (els.report) els.report.innerHTML = '';
-    if (els.review) els.review.textContent = '';
-    setText(els.words, '');
-    setText(els.round, '');
-    setText(els.timer, '00:00');
-    show(els.error, false);
-    show(els.copy, false);
-    show(els.download, false);
+    flushPara(); flushList(); flushTable();
+    return out.join('\n');
   }
 
   // ---------- event handlers ----------
   function onStart(data) {
-    setText(els.status, 'Researcher is working...');
-    setStep('researcher_node', 'running');
-    addLog('Started report on: ' + (data.topic || lastTopic));
+    log('Started report on: ' + (data.topic || ''));
+    setBar(3);
   }
 
   function onProgress(data) {
-    const node = data.node;
-    const update = data.update || {};
-
+    var update = data.update || {};
     if (update.error) {
-      setStep(node, 'error');
-      addLog(data.message || ('Step failed: ' + update.error), 'error');
+      log('Step failed (' + (data.agent || data.node) + '): ' + update.error, 'error');
       return;
     }
 
-    // A second writer step means the Reviewer asked for a revision
-    if (node === 'writer_node' && $('step-reviewer_node') &&
-        $('step-reviewer_node').classList.contains('step-done')) {
-      setStep('reviewer_node', 'waiting');
+    var name = data.agent || data.node || 'Agent';
+    log(data.message || (name + ' finished'));
+
+    var step = Number(data.step), total = Number(data.total_steps) || 4;
+    if (step) setBar((step / total) * 100);
+
+    if (data.node === 'reviewer_node' && update.feedback && update.feedback.overall_score) {
+      var review = String(update.feedback.overall_score).split('\n').filter(Boolean).slice(0, 2).join(' | ');
+      log('Review: ' + review, /verdict:\s*pass/i.test(review) ? 'success' : 'warn');
     }
-    if (node === 'writer_node' && data.round) setText(els.round, 'Draft ' + data.round);
-
-    setStep(node, 'done');
-    addLog(data.message || (data.agent + ' finished'));
-
-    if (node === 'reviewer_node' && update.feedback && els.review) {
-      els.review.textContent = update.feedback.overall_score || '';
-    }
-
-    if (node === 'final_node') {
-      agents.forEach((a) => setStep(a.node, 'done'));
-      setText(els.status, 'Final Editor finished');
-      return;
-    }
-
-    const next = nextNodeAfter(node, update);
-    if (next) {
-      setStep(next, 'running');
-      const info = agents.find((a) => a.node === next);
-      const revising = node === 'reviewer_node' && next === 'writer_node';
-      setText(els.status, (info ? info.agent : next) + (revising ? ' is revising the draft...' : ' is working...'));
-      if (revising) addLog('Reviewer asked for changes - sending the draft back to the Writer', 'warn');
+    if (data.node === 'writer_node' && data.round) {
+      log('Draft ' + data.round + ' written');
     }
   }
 
@@ -268,137 +222,95 @@
     finished = true;
     closeSource();
     setRunning(false);
-    agents.forEach((a) => setStep(a.node, 'done'));
-    if (els.bar) els.bar.style.width = '100%';
 
-    lastReport = data.report || (data.state && (data.state.final_report || data.state.draft)) || '';
-    if (data.review && els.review) els.review.textContent = data.review;
+    var state = data.state || {};
+    var report = data.report || state.final_report || state.draft || '';
 
-    if (!lastReport) {
-      showError('The workflow finished but returned no report.');
+    if (!report) {
+      log('The workflow finished but returned no report.', 'error');
       return;
     }
-    if (els.report) els.report.innerHTML = renderMarkdown(lastReport);
-    const words = lastReport.trim().split(/\s+/).length;
-    setText(els.words, words + ' words');
-    setText(els.status, 'Report ready');
-    addLog('Report ready (' + words + ' words)', 'success');
-    show(els.copy, true);
-    show(els.download, true);
+    setBar(100);
+    els.report.innerHTML = renderMarkdown(report);
+    log('Report ready (' + report.trim().split(/\s+/).length + ' words)', 'success');
+    els.report.scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
 
   function onServerError(data) {
     finished = true;
     closeSource();
     setRunning(false);
-    showError((data && data.message) || 'The workflow failed.');
+    log('Error: ' + ((data && data.message) || 'The workflow failed.'), 'error');
   }
 
-  // ---------- start / stop ----------
-  function startReport(topic) {
+  // ---------- start ----------
+  function startReport() {
+    var topic = (els.topic ? els.topic.value : '').trim();
+    if (topic.length < 3) { log('Please enter a topic of at least 3 characters.', 'error'); return; }
+
     closeSource();
-    resetUI();
-    lastTopic = topic;
+    finished = false;
+    maxPercent = 0;
+    if (els.log) els.log.innerHTML = '';
+    els.report.innerHTML = '';
+    setBar(0);
     setRunning(true);
-    setText(els.status, 'Connecting...');
+    log('Connecting...');
 
-    const params = new URLSearchParams({
+    var length = lengthValue();
+    var params = new URLSearchParams({
       topic: topic,
-      report_length: els.length ? els.length.value : 'detailed',
-      tone: els.tone ? els.tone.value : 'professional',
+      tone: toneValue(),
+      length: length,          // name used by the earlier working page
+      report_length: length    // name used by newer versions
     });
-    source = new EventSource(API_BASE + '/api/reports/stream?' + params.toString());
+    var url = API_BASE + '/api/reports/stream?' + params.toString();
 
-    const parse = (fn) => (e) => {
-      try { fn(JSON.parse(e.data)); } catch (err) { console.error('Bad event data', err, e.data); }
-    };
+    try {
+      source = new EventSource(url);
+    } catch (e) {
+      setRunning(false);
+      log('Could not open the stream: ' + e.message, 'error');
+      return;
+    }
+
+    function parse(fn) {
+      return function (e) {
+        var data;
+        try { data = JSON.parse(e.data); } catch (err) { console.error('Bad event data', e.data); return; }
+        fn(data);
+      };
+    }
+
     source.addEventListener('start', parse(onStart));
     source.addEventListener('progress', parse(onProgress));
     source.addEventListener('done', parse(onDone));
 
     // "error" is both our server event (has data) and the browser's connection error (no data)
-    source.addEventListener('error', (e) => {
+    source.addEventListener('error', function (e) {
       if (e && e.data) {
-        try { onServerError(JSON.parse(e.data)); } catch (_) { onServerError({ message: e.data }); }
+        try { onServerError(JSON.parse(e.data)); } catch (err) { onServerError({ message: e.data }); }
         return;
       }
       if (finished) return;
-      // Close so the browser does not auto-reconnect and restart the workflow
-      finished = true;
+      finished = true;                 // stop the browser from reconnecting and restarting the run
       closeSource();
       setRunning(false);
-      showError('Connection to the server was lost. Check that app.py is running.');
+      log('Connection to the server was lost. Check the terminal running app.py for the error.', 'error');
     });
   }
 
-  function stopReport() {
-    if (finished) return;
-    finished = true;
-    closeSource();
-    setRunning(false);
-    setText(els.status, 'Stopped');
-    addLog('Stopped by user (the server may finish the current step)', 'warn');
+  // ---------- wire up ----------
+  var form = els.button && els.button.closest ? els.button.closest('form') : null;
+  if (form) {
+    form.addEventListener('submit', function (e) { e.preventDefault(); startReport(); });
   }
-
-  // ---------- copy / download ----------
-  async function copyReport() {
-    if (!lastReport) return;
-    try {
-      await navigator.clipboard.writeText(lastReport);
-      addLog('Report copied to clipboard', 'success');
-    } catch (_) {
-      addLog('Copy failed - select the text and copy manually', 'warn');
-    }
+  if (els.button) {
+    els.button.addEventListener('click', function (e) {
+      if (form) return;                // the submit handler above will run
+      e.preventDefault();
+      startReport();
+    });
   }
-
-  function downloadReport() {
-    if (!lastReport) return;
-    const name = (lastTopic || 'report').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 60) || 'report';
-    const blob = new Blob([lastReport], { type: 'text/markdown;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = name + '.md';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  // ---------- init ----------
-  async function loadAgents() {
-    try {
-      const res = await fetch(API_BASE + '/api/agents');
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      const data = await res.json();
-      if (Array.isArray(data.agents) && data.agents.length) agents = data.agents;
-    } catch (err) {
-      console.warn('Using default agent list:', err);
-    }
-    renderSteps();
-  }
-
-  function init() {
-    loadAgents();
-    show(els.stop, false);
-    show(els.error, false);
-    show(els.copy, false);
-    show(els.download, false);
-
-    if (els.form) {
-      els.form.addEventListener('submit', (e) => {
-        e.preventDefault();
-        const topic = (els.topic ? els.topic.value : '').trim();
-        if (topic.length < 3) { showError('Please enter a topic of at least 3 characters.'); show(els.error, true); return; }
-        if (topic.length > 300) { showError('Topic is too long (max 300 characters).'); return; }
-        startReport(topic);
-      });
-    }
-    if (els.stop) els.stop.addEventListener('click', stopReport);
-    if (els.copy) els.copy.addEventListener('click', copyReport);
-    if (els.download) els.download.addEventListener('click', downloadReport);
-  }
-
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
-  else init();
+  window.addEventListener('beforeunload', closeSource);
 })();
