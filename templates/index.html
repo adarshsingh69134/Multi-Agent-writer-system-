@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Multi-Agent Report Writer</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --text:#1c1f24; --muted:#6b7280; --line:#dfe3e8; --accent:#2f5bea; --ok:#1a7f4b; --err:#c0362c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background:var(--bg); color:var(--text); line-height:1.5; }
+  main { max-width: 860px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  label { display:block; font-size:.85rem; color:var(--muted); margin-bottom:4px; }
+  input, select { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font: inherit; background:#fff; color:var(--text); }
+  .row { display:grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+  .api { margin-top: 12px; }
+  button { margin-top: 14px; padding: 10px 18px; border: 0; border-radius: 8px; background: var(--accent); color:#fff; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .55; cursor: not-allowed; }
+  button.secondary { background: #fff; color: var(--text); border: 1px solid var(--line); margin-left: 8px; }
+  ul#steps { list-style: none; margin: 0; padding: 0; }
+  ul#steps li { padding: 8px 0; border-bottom: 1px solid var(--line); display:flex; gap:10px; align-items:baseline; }
+  ul#steps li:last-child { border-bottom: 0; }
+  .dot { width:10px; height:10px; border-radius:50%; background: var(--ok); flex: none; }
+  .time { color: var(--muted); font-size: .8rem; margin-left:auto; flex:none; }
+  .detail { color: var(--muted); font-size: .85rem; }
+  #status { font-size: .9rem; color: var(--muted); margin-top: 10px; min-height: 1.2em; }
+  #status.error { color: var(--err); }
+  #report { white-space: pre-wrap; word-wrap: break-word; font-family: Georgia, "Times New Roman", serif; font-size: 1rem; }
+  .meta { font-size: .85rem; color: var(--muted); margin-bottom: 8px; }
+  .hidden { display: none; }
+  @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Multi-Agent Report Writer</h1>
+  <p class="sub">Planner, Researcher, Literature, Writer, Reviewer, Citation and Editor agents working on your topic.</p>
+
+  <section class="card">
+    <label for="topic">Report topic</label>
+    <input id="topic" type="text" placeholder="e.g. Advancements in Quantum Computing" maxlength="300">
+
+    <div class="row">
+      <div>
+        <label for="tone">Tone</label>
+        <select id="tone">
+          <option value="professional">Professional</option>
+          <option value="academic">Academic</option>
+          <option value="simple">Simple</option>
+        </select>
+      </div>
+      <div>
+        <label for="length">Length</label>
+        <select id="length">
+          <option value="short">Short</option>
+          <option value="detailed" selected>Detailed</option>
+          <option value="comprehensive">Comprehensive</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="api">
+      <label for="api">API address</label>
+      <input id="api" type="text" value="http://localhost:8000">
+    </div>
+
+    <button id="start">Generate report</button>
+    <button id="stop" class="secondary hidden">Stop</button>
+    <div id="status"></div>
+  </section>
+
+  <section class="card hidden" id="progressCard">
+    <strong>Agent progress</strong>
+    <ul id="steps"></ul>
+  </section>
+
+  <section class="card hidden" id="reportCard">
+    <div class="meta" id="meta"></div>
+    <div id="report"></div>
+    <button id="copy" class="secondary" style="margin-left:0">Copy report</button>
+    <button id="download" class="secondary">Download .md</button>
+  </section>
+</main>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const startBtn = $("start"), stopBtn = $("stop"), statusEl = $("status");
+  let source = null, startedAt = 0, finished = false;
+
+  // Friendly names for the workflow nodes (unknown nodes fall back to their own name)
+  const LABELS = {
+    planner_node: "Planner: outline and research plan",
+    research_node: "Researcher and Literature: gathering sources",
+    researcher_node: "Researcher: gathering information",
+    literature_node: "Literature: finding papers",
+    writer_node: "Writer: drafting / revising",
+    reviewer_node: "Reviewer: scoring the draft",
+    citation_node: "Citation: checking references",
+    editor_node: "Editor: final polish",
+    final_aggregator_node: "Final aggregator: final report"
+  };
+
+  function setStatus(text, isError) {
+    statusEl.textContent = text;
+    statusEl.className = isError ? "error" : "";
+  }
+
+  function secs() { return ((Date.now() - startedAt) / 1000).toFixed(1) + "s"; }
+
+  function summarise(update) {
+    if (!update || typeof update !== "object") return "";
+    const parts = [];
+    if (update.feedback && update.feedback.overall_score !== undefined) {
+      parts.push("score " + update.feedback.overall_score + (update.feedback.pass ? " (pass)" : " (needs revision)"));
+    }
+    if (update.revision_round !== undefined) parts.push("round " + update.revision_round);
+    if (update.citations && Array.isArray(update.citations.issues)) parts.push(update.citations.issues.length + " citation issue(s)");
+    return parts.join(" · ");
+  }
+
+  function addStep(node, update) {
+    const li = document.createElement("li");
+    const dot = document.createElement("span"); dot.className = "dot";
+    const body = document.createElement("div");
+    const title = document.createElement("div");
+    title.textContent = LABELS[node] || node;
+    body.appendChild(title);
+    const info = summarise(update);
+    if (info) {
+      const d = document.createElement("div"); d.className = "detail"; d.textContent = info;
+      body.appendChild(d);
+    }
+    const t = document.createElement("span"); t.className = "time"; t.textContent = secs();
+    li.append(dot, body, t);
+    $("steps").appendChild(li);
+  }
+
+  function showReport(state) {
+    const text = state.final_report || state.draft || "(no report text was returned)";
+    $("report").textContent = typeof text === "string" ? text : JSON.stringify(text, null, 2);
+    const fb = state.feedback || {};
+    const bits = ["Topic: " + state.topic];
+    if (fb.overall_score !== undefined) bits.push("Final review score: " + fb.overall_score);
+    if (state.revision_round !== undefined) bits.push("Writer rounds: " + state.revision_round);
+    bits.push("Time: " + secs());
+    $("meta").textContent = bits.join("  ·  ");
+    $("reportCard").classList.remove("hidden");
+  }
+
+  function finish() {
+    if (source) { source.close(); source = null; }
+    startBtn.disabled = false;
+    stopBtn.classList.add("hidden");
+  }
+
+  startBtn.addEventListener("click", () => {
+    const topic = $("topic").value.trim();
+    if (topic.length < 3) { setStatus("Please enter a topic (at least 3 characters).", true); return; }
+
+    const base = $("api").value.trim().replace(/\/+$/, "");
+    const params = new URLSearchParams({ topic, tone: $("tone").value, report_length: $("length").value });
+
+    $("steps").innerHTML = "";
+    $("report").textContent = "";
+    $("reportCard").classList.add("hidden");
+    $("progressCard").classList.remove("hidden");
+    startBtn.disabled = true;
+    stopBtn.classList.remove("hidden");
+    finished = false;
+    startedAt = Date.now();
+    setStatus("Connecting...");
+
+    source = new EventSource(base + "/api/reports/stream?" + params.toString());
+
+    source.addEventListener("start", () => setStatus("Agents are working. This can take a few minutes..."));
+
+    source.addEventListener("progress", (e) => {
+      const d = JSON.parse(e.data);
+      addStep(d.node, d.update);
+    });
+
+    source.addEventListener("done", (e) => {
+      finished = true;
+      const d = JSON.parse(e.data);
+      showReport(d.state || {});
+      setStatus("Finished in " + secs() + ".");
+      finish();
+    });
+
+    // Event sent by the server when the workflow fails
+    source.addEventListener("error", (e) => {
+      if (e.data) {
+        finished = true;
+        setStatus("Error: " + (JSON.parse(e.data).message || "unknown error"), true);
+        finish();
+      } else if (!finished) {
+        // Connection-level error (server down, wrong address, CORS)
+        setStatus("Could not reach the API at " + base + ". Is the server running?", true);
+        finish();
+      }
+    });
+  });
+
+  stopBtn.addEventListener("click", () => { finished = true; finish(); setStatus("Stopped. The server may still finish the run."); });
+
+  $("copy").addEventListener("click", async () => {
+    try { await navigator.clipboard.writeText($("report").textContent); setStatus("Report copied."); }
+    catch (_) { setStatus("Copy failed. Select the text and copy it manually.", true); }
+  });
+
+  $("download").addEventListener("click", () => {
+    const blob = new Blob([$("report").textContent], { type: "text/markdown" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "report.md";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+</script>
+</body>
+</html>

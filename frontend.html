@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Multi-Agent Report Writer</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f8f9fa;
+            color: #333;
+        }
+        .container {
+            background: white;
+            padding: 25px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #2c3e50;
+            margin-top: 0;
+        }
+        .input-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+        }
+        input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 16px;
+            box-sizing: border-box;
+        }
+        button {
+            padding: 10px 20px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        button:hover {
+            background: #2980b9;
+        }
+        button:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+        }
+        #status {
+            margin: 15px 0;
+            padding: 10px;
+            background: #ecf0f1;
+            border-radius: 4px;
+            display: none;
+        }
+        #progress-bar {
+            width: 100%;
+            height: 8px;
+            background: #eee;
+            border-radius: 4px;
+            overflow: hidden;
+            margin: 10px 0;
+        }
+        #progress-fill {
+            height: 100%;
+            width: 0%;
+            background: #3498db;
+            transition: width 0.2s;
+        }
+        .logs {
+            height: 300px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            padding: 10px;
+            overflow-y: auto;
+            font-family: monospace;
+            font-size: 12px;
+            margin-top: 15px;
+            background: #fafafa;
+        }
+        .log-entry {
+            margin: 2px 0;
+            padding: 2px 4px;
+            border-radius: 3px;
+        }
+        .log-planner { color: #e67e22; }
+        .log-researcher { color: #2ecc71; }
+        .log-writer { color: #f1c40f; }
+        .log-reviewer { color: #9b59b6; }
+        .log-citation { color: #e74c3c; }
+        .log-done { color: #27ae60; font-weight: bold; }
+        .log-error { color: #c0392b; background: #fdedec; padding: 2px 4px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📝 Multi-Agent Report Writer</h1>
+
+        <div class="input-group">
+            <label for="topic">Report Topic</label>
+            <input type="text" id="topic" placeholder="e.g., Advancements in Quantum Computing">
+        </div>
+
+        <div class="input-group">
+            <label for="tone">Tone</label>
+            <select id="tone">
+                <option value="professional">Professional</option>
+                <option value="casual">Casual</option>
+                <option value="academic">Academic</option>
+            </select>
+        </div>
+
+        <div class="input-group">
+            <label for="length">Report Length</label>
+            <select id="length">
+                <option value="detailed">Detailed</option>
+                <option value="summary">Summary</option>
+            </select>
+        </div>
+
+        <button id="generateBtn" onclick="generateReport()">Generate Report</button>
+
+        <div id="status">Working...</div>
+
+        <div id="progress">
+            <div id="progress-bar">
+                <div id="progress-fill"></div>
+            </div>
+        </div>
+
+        <h3>Live Agent Activity</h3>
+        <div class="logs" id="logs"></div>
+
+        <div id="result" style="margin-top: 20px; display: none; padding: 20px; background: #d5f4e3; border-radius: 4px;"></div>
+    </div>
+
+    <script>
+        // Check if Server-Sent Events are supported
+        if (!!window.EventSource == false) {
+            alert('Your browser does not support Server-Sent Events. Please use a modern browser.');
+        }
+
+        const logsDiv = document.getElementById('logs');
+        const resultDiv = document.getElementById('result');
+        const generateBtn = document.getElementById('generateBtn');
+        const topicInput = document.getElementById('topic');
+        const progressFill = document.getElementById('progress-fill');
+
+        // Map agent names to CSS classes
+        const agentClasses = {
+            'planner_node': 'log-planner',
+            'researcher_node': 'log-researcher',
+            'literature_node': 'log-researcher',
+            'writer_node': 'log-writer',
+            'reviewer_node': 'log-reviewer',
+            'citation_node': 'log-citation',
+            'final_aggregator_node': 'log-done'
+        };
+
+        function addLog(agent, message) {
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${agentClasses[agent] || ''}`;
+            entry.textContent = `${message}`;
+            logsDiv.appendChild(entry);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        }
+
+        function generateReport() {
+            const topic = topicInput.value.trim();
+            if (!topic) {
+                alert('Please enter a topic');
+                return;
+            }
+
+            generateBtn.disabled = true;
+            generateBtn.textContent = 'Generating...';
+            statusDiv.style.display = 'block';
+            logsDiv.innerHTML = '';
+            resultDiv.style.display = 'none';
+            progressFill.style.width = '0%';
+
+            // Connect to the SSE endpoint
+            const source = new EventSource(`/api/reports/stream?topic=${encodeURIComponent(topic)}&tone=professional&length=detailed`);
+
+            source.onopen = function() {
+                console.log('SSE connection opened');
+            };
+
+            source.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+
+                if (data.event === 'start') {
+                    addLog('system', `Starting report on: ${data.data.topic}`);
+                }
+                else if (data.event === 'progress') {
+                    // Update progress based on which agent is active
+                    if (data.data.node) {
+                        addLog(data.data.node, `Agent working...`);
+                    }
+                    // Update progress bar roughly
+                    const percent = Math.min(95, Math.round((Math.random() * 20) + 5));
+                    progressFill.style.width = `${percent}%`;
+                }
+                else if (data.event === 'done') {
+                    source.close();
+                    generateBtn.disabled = false;
+                    generateBtn.textContent = 'Generate Report';
+                    statusDiv.style.display = 'none';
+
+                    // Show final result
+                    resultDiv.style.display = 'block';
+                    resultDiv.innerHTML = `
+                        <h3>✅ Report Generated: ${data.data.topic}</h3>
+                        <p><strong>Status:</strong> Completed successfully</p>
+                        <p><strong>Revision Rounds:</strong> ${data.data.revision_round || 0}</p>
+                    `;
+
+                    // You can access the full state here if needed
+                    console.log('Full report state:', data.data);
+                }
+                else if (data.event === 'error') {
+                    source.close();
+                    generateBtn.disabled = false;
+                    generateBtn.textContent = 'Generate Report';
+                    statusDiv.style.display = 'none';
+                    alert('Error: ' + data.data.message);
+                }
+            };
+
+            source.onerror = function() {
+                generateBtn.disabled = false;
+                generateBtn.textContent = 'Generate Report';
+                statusDiv.style.display = 'none';
+                addLog('error', 'SSE connection failed or was closed');
+                source.close();
+            };
+        }
+
+        // Helper to style the status div
+        const statusDiv = document.getElementById('status');
+    </script>
+</body>
+</html>
