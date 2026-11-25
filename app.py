@@ -2,22 +2,22 @@
 FastAPI app for the Multi-Agent Report Writer System (4 agents).
 
 Agents / workflow steps
-  1. Researcher  (researcher_node)  plans key questions, searches web + arXiv
-  2. Writer      (writer_node)      writes the report, revises from feedback
-  3. Reviewer    (reviewer_node)    scores it; sends it back to the Writer or passes
-  4. Final Editor (final_node)      combines notes, papers, draft and review into the final report
+  1. Researcher   (researcher_node)  plans key questions, searches web + arXiv
+  2. Writer       (writer_node)      writes the report, revises from feedback
+  3. Reviewer     (reviewer_node)    scores it; sends it back to the Writer or passes
+  4. Final Editor (final_node)       combines notes, papers, draft and review into the final report
 
 Run:  python app.py
   or: uvicorn app:app --reload --port 8000
 Needs: pip install fastapi uvicorn
 
-backend.py must expose:
+backend.py exposes:
   run_report_stream(topic, user_settings) -> generator of (event, data) pairs
-  checkpointer (with load_state)
+  get_checkpointer(), get_cache_checkpointer(), make_state_key()
 
 Endpoints
   GET  /health                       liveness check
-  GET  /api/agents                   the three agents and their order
+  GET  /api/agents                   the four agents and their order
   GET  /api/reports/stream?topic=... Server-Sent Events, one event per agent step
   POST /api/reports                  runs the whole workflow, returns the final state
   GET  /api/reports/{topic}          loads a saved state
@@ -31,8 +31,10 @@ SSE events
   error     {"message": ...}
 """
 
+from contextlib import asynccontextmanager
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterator
 
@@ -41,15 +43,20 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from backend import checkpointer, run_report_stream
+from backend import (
+    get_cache_checkpointer,
+    get_checkpointer,
+    make_state_key,
+    run_report_stream,
+)
 
 logger = logging.getLogger("app")
 
-HOST = "127.0.0.1"  # use "0.0.0.0" to allow other devices on your network
-PORT = 8000
+HOST = os.environ.get("HOST", "127.0.0.1")  # set HOST=0.0.0.0 in production/Render
+PORT = int(os.environ.get("PORT", 8000))
 BASE_DIR = Path(__file__).resolve().parent
 
-# The three agents, in workflow order. Keys match the node names in backend.py.
+# The four agents, in workflow order. Keys match the node names in backend.py.
 AGENTS: Dict[str, Dict[str, Any]] = {
     "researcher_node": {"agent": "Researcher", "step": 1, "role": "Plans key questions and gathers sources"},
     "writer_node": {"agent": "Writer", "step": 2, "role": "Writes and revises the report"},
@@ -58,7 +65,22 @@ AGENTS: Dict[str, Dict[str, Any]] = {
 }
 TOTAL_STEPS = len(AGENTS)
 
-app = FastAPI(title="Multi-Agent Report Writer", version="3.0.0")
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    yield
+    # Clean up cached DB/Redis connections when the server stops
+    try:
+        get_checkpointer().close()
+    except Exception:
+        pass
+    try:
+        get_cache_checkpointer().close()
+    except Exception:
+        pass
+
+
+app = FastAPI(title="Multi-Agent Report Writer", version="3.0.0", lifespan=lifespan)
 
 # Lets the plain HTML frontend call the API from another origin or port.
 # Tighten allow_origins before any real deployment.
@@ -89,7 +111,10 @@ def sse(event: str, data: Any) -> str:
 
 
 def settings_from(report_length: str, tone: str) -> Dict[str, str]:
-    return {"report_length": report_length.strip().lower(), "tone": tone.strip()}
+    length = report_length.strip().lower()
+    if length not in {"short", "detailed", "comprehensive"}:
+        length = "detailed"
+    return {"report_length": length, "tone": tone.strip() or "professional"}
 
 
 def describe_step(node: str, changes: Any) -> Dict[str, Any]:
@@ -125,7 +150,7 @@ def describe_step(node: str, changes: Any) -> Dict[str, Any]:
 def sse_events(topic: str, settings: Dict[str, str]) -> Iterator[str]:
     """Wrap backend.run_report_stream() as SSE text."""
     try:
-        for event, data in run_report_stream(topic, settings):
+        for event, data in run_report_stream(topic.strip(), settings):
             if event == "progress":
                 yield sse("progress", describe_step(data.get("node", ""), data.get("update")))
             elif event == "done":
@@ -180,7 +205,10 @@ def stream_report(
 def create_report(req: ReportRequest) -> Dict[str, Any]:
     """Non-streaming version: waits for the whole workflow, returns the final state."""
     final_state = None
-    for event, data in run_report_stream(req.topic, settings_from(req.report_length, req.tone)):
+    for event, data in run_report_stream(
+        req.topic.strip(),
+        settings_from(req.report_length, req.tone),
+    ):
         if event == "error":
             raise HTTPException(status_code=500, detail=data.get("message", "Workflow failed"))
         if event == "done":
@@ -191,8 +219,21 @@ def create_report(req: ReportRequest) -> Dict[str, Any]:
 
 
 @app.get("/api/reports/{topic}")
-def get_saved_report(topic: str) -> Dict[str, Any]:
-    saved = checkpointer.load_state(topic)
+def get_saved_report(
+    topic: str,
+    report_length: str = "detailed",
+    tone: str = "professional",
+) -> Dict[str, Any]:
+    settings = settings_from(report_length, tone)
+    key = make_state_key(topic, settings)
+
+    cache_cp = get_cache_checkpointer()
+    cp = get_checkpointer()
+
+    saved = cache_cp.load_state(key) or cp.load_state(key)
+    if not saved:
+        # Fallback for legacy rows keyed by bare topic
+        saved = cp.load_state(topic.strip())
     if not saved:
         raise HTTPException(status_code=404, detail="No saved report for this topic")
     return saved
@@ -200,20 +241,27 @@ def get_saved_report(topic: str) -> Dict[str, Any]:
 
 @app.get("/style.css", include_in_schema=False)
 def serve_css():
-    return FileResponse(BASE_DIR / "style.css", media_type="text/css")
+    css_file = BASE_DIR / "style.css"
+    if not css_file.exists():
+        raise HTTPException(status_code=404, detail="style.css not found")
+    return FileResponse(css_file, media_type="text/css")
 
 
 @app.get("/script.js", include_in_schema=False)
 def serve_js():
-    return FileResponse(BASE_DIR / "script.js", media_type="application/javascript")
+    js_file = BASE_DIR / "script.js"
+    if not js_file.exists():
+        raise HTTPException(status_code=404, detail="script.js not found")
+    return FileResponse(js_file, media_type="application/javascript")
 
 
 @app.get("/", include_in_schema=False)
 def home():
-    page = BASE_DIR / "frontend.html"
-    if not page.exists():
-        raise HTTPException(status_code=404, detail="frontend.html not found next to app.py")
-    return FileResponse(page)
+    for filename in ("frontend.html", "frontend_old.html"):
+        page = BASE_DIR / filename
+        if page.exists():
+            return FileResponse(page)
+    raise HTTPException(status_code=404, detail="frontend.html not found next to app.py")
 
 
 # ----------------------------------------------------------------------------
